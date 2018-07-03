@@ -11,7 +11,6 @@ import io.iohk.ethereum.metrics.Metrics
 import io.iohk.ethereum.utils.Config.SyncConfig
 import io.iohk.ethereum.utils.{BlockchainConfig, DaoForkConfig, Logger}
 import io.iohk.ethereum.vm._
-import org.spongycastle.util.encoders.Hex
 
 trait Ledger {
   def consensus: Consensus
@@ -57,7 +56,8 @@ trait Ledger {
    *         - [[io.iohk.ethereum.ledger.NewBetterBranch]] - the headers form a better branch than our current main chain
    *         - [[io.iohk.ethereum.ledger.NoChainSwitch]] - the headers do not form a better branch
    *         - [[io.iohk.ethereum.ledger.UnknownBranch]] - the parent of the first header is unknown (caller should obtain more headers)
-   *         - [[io.iohk.ethereum.ledger.InvalidBranch]] - headers do not form a chain or last header number is less than current best block number
+   *         - [[io.iohk.ethereum.ledger.InvalidBranchNoChain]] - headers do not form a chain
+   *         - [[io.iohk.ethereum.ledger.InvalidBranchLastBlockNumberIsSmall]] - last header number is less than current best block number
    */
   def resolveBranch(headers: Seq[BlockHeader]): BranchResolutionResult
 
@@ -97,12 +97,12 @@ class LedgerImpl(
 
   // scalastyle:off method.length
   def importBlock(block: Block): BlockImportResult = {
-    val validationResult = validateBlockBeforeExecution(block)
+    val validationResult = validateBlockBeforeExecution("importBlock", block)
     validationResult match {
       case Left(ValidationBeforeExecError(HeaderParentNotFoundError)) =>
         val isGenesis = block.header.number == 0 && blockchain.genesisHeader.hash == block.header.hash
         if (isGenesis){
-          log.debug(s"Ignoring duplicate genesis block: (${block.idTag})")
+          log.info(s"Ignoring duplicate genesis block: ${block.idTag}")
           DuplicateBlock
         } else {
           log.debug(s"Block(${block.idTag}) has no known parent")
@@ -110,7 +110,7 @@ class LedgerImpl(
         }
 
       case Left(ValidationBeforeExecError(reason)) =>
-        log.debug(s"Block(${block.idTag}) failed pre-import validation")
+        log.debug(s"Block ${block.idTag} failed pre-import validation. Reason: ${reason}")
         BlockImportFailed(reason.toString)
 
       case Right(_) =>
@@ -158,8 +158,8 @@ class LedgerImpl(
         BlockImportedToTop(importedBlocks, totalDifficulties)
     }
 
-    importedBlocks.foreach { b =>
-      log.debug(s"Imported new block (${b.header.number}: ${Hex.toHexString(b.header.hash.toArray)}) to the top of chain")
+    importedBlocks.foreach { block =>
+      log.info(s"Imported new block ${block.idTag} to the top of chain")
     }
 
     if(importedBlocks.nonEmpty) {
@@ -307,21 +307,11 @@ class LedgerImpl(
     }
   }
 
-  /**
-    * Finds a relation of a given list of headers to the current chain
-    * Note:
-    *   - the headers should form a chain (headers ordered by number)
-    *   - last header number should be greater or equal than current best block number
-    * @param headers - a list of headers to be checked
-    * @return One of:
-    *         - [[NewBetterBranch]] - the headers form a better branch than our current main chain
-    *         - [[NoChainSwitch]] - the headers do not form a better branch
-    *         - [[UnknownBranch]] - the parent of the first header is unknown (caller should obtain more headers)
-    *         - [[InvalidBranch]] - headers do not form a chain or last header number is less than current best block number
-    */
   def resolveBranch(headers: Seq[BlockHeader]): BranchResolutionResult = {
-    if (!doHeadersFormChain(headers) || headers.last.number < blockchain.getBestBlockNumber())
-      InvalidBranch
+    if (!doHeadersFormChain(headers))
+      InvalidBranchNoChain
+    else if (headers.last.number < blockchain.getBestBlockNumber())
+      InvalidBranchLastBlockNumberIsSmall
     else {
       val parentIsKnown = blockchain.getBlockHeaderByHash(headers.head.parentHash).isDefined
 
@@ -382,23 +372,30 @@ class LedgerImpl(
   }
 
   def executeBlock(block: Block, alreadyValidated: Boolean = false): Either[BlockExecutionError, Seq[Receipt]] = {
+    val context = "executeBlock"
 
-    val preExecValidationResult = if (alreadyValidated) Right(block) else validateBlockBeforeExecution(block)
+    val preExecValidationResult = if (alreadyValidated) Right(block) else validateBlockBeforeExecution(context, block)
 
     val blockExecResult = for {
       _ <- preExecValidationResult
 
-      execResult <- executeBlockTransactions(block)
+      execResult <- executeBlockTransactions(context, block)
       BlockResult(resultingWorldStateProxy, gasUsed, receipts) = execResult
       worldToPersist = _blockPreparator.payBlockReward(block, resultingWorldStateProxy)
       worldPersisted = InMemoryWorldStateProxy.persistState(worldToPersist) //State root hash needs to be up-to-date for validateBlockAfterExecution
 
-      _ <- validateBlockAfterExecution(block, worldPersisted.stateRootHash, receipts, gasUsed)
+      _ <- validateBlockAfterExecution(context, block, worldPersisted.stateRootHash, receipts, gasUsed)
 
     } yield receipts
 
-    if(blockExecResult.isRight)
-      log.debug(s"Block ${block.header.number} (with hash: ${block.header.hashAsHexString}) executed correctly")
+    blockExecResult match {
+      case Left(error) ⇒
+        log.info(s"Block ${block.idTag} executed with error(s): ${error.reason}")
+
+      case _ ⇒
+        log.debug(s"Block ${block.idTag} executed correctly")
+    }
+
     blockExecResult
   }
 
@@ -407,8 +404,11 @@ class LedgerImpl(
     *
     * @param block
     */
-  private[ledger] def executeBlockTransactions(block: Block):
-  Either[BlockExecutionError, BlockResult] = {
+  private[ledger] def executeBlockTransactions(block: Block): Either[BlockExecutionError, BlockResult] = {
+    executeBlockTransactions("", block)
+  }
+
+  private[ledger] def executeBlockTransactions(context: String, block: Block): Either[BlockExecutionError, BlockResult] = {
     val parentStateRoot = blockchain.getBlockHeaderByHash(block.header.parentHash).map(_.stateRoot)
     val initialWorld =
       blockchain.getWorldStateProxy(
@@ -423,11 +423,20 @@ class LedgerImpl(
       case _ => initialWorld
     }
 
-    log.debug(s"About to execute ${block.body.transactionList.size} txs from block ${block.header.number} (with hash: ${block.header.hashAsHexString})")
+    val transactionCount = block.body.transactionList.size
+    if(transactionCount > 0) {
+      log.debug(s"About to execute ${transactionCount} txs from block ${block.idTag}")
+    }
+
     val blockTxsExecResult = _blockPreparator.executeTransactions(block.body.transactionList, inputWorld, block.header)
     blockTxsExecResult match {
-      case Right(_) => log.debug(s"All txs from block ${block.header.hashAsHexString} were executed successfully")
-      case Left(error) => log.debug(s"Not all txs from block ${block.header.hashAsHexString} were executed correctly, due to ${error.reason}")
+      case Right(_) =>
+        if(transactionCount > 0) {
+          log.info(s"All ${transactionCount} txs from block ${block.idTag} were executed successfully")
+        }
+
+      case Left(error) =>
+        log.error(s"[$context] Not all ${transactionCount} txs from block ${block.idTag} were executed correctly, due to ${error.reason}")
     }
     blockTxsExecResult
   }
@@ -470,12 +479,20 @@ class LedgerImpl(
     }
   }
 
-  private def validateBlockBeforeExecution(block: Block): Either[ValidationBeforeExecError, BlockExecutionSuccess] = {
-    consensus.validators.validateBlockBeforeExecution(
+  private[ledger] def validateBlockBeforeExecution(context: String, block: Block): Either[ValidationBeforeExecError, BlockExecutionSuccess] = {
+    val result = consensus.validators.validateBlockBeforeExecution(
       block = block,
       getBlockHeaderByHash = getHeaderFromChainOrQueue,
       getNBlocksBack = getNBlocksBackFromChainOrQueue
     )
+
+    result match {
+      case Left(ValidationBeforeExecError(reason)) ⇒
+        log.error(s"[$context/validateBeforeExecution] Block: ${block.idTag}. Reason: ${reason}")
+      case _ ⇒
+    }
+
+    result
   }
 
   private[ledger] def validateBlockAfterExecution(
@@ -484,13 +501,37 @@ class LedgerImpl(
     receipts: Seq[Receipt],
     gasUsed: BigInt
   ): Either[BlockExecutionError, BlockExecutionSuccess] = {
-
-    consensus.validators.validateBlockAfterExecution(
+    validateBlockAfterExecution(
+      context = "",
       block = block,
       stateRootHash = stateRootHash,
       receipts = receipts,
       gasUsed = gasUsed
     )
+  }
+
+  private[ledger] def validateBlockAfterExecution(
+    context: String,
+    block: Block,
+    stateRootHash: ByteString,
+    receipts: Seq[Receipt],
+    gasUsed: BigInt
+  ): Either[BlockExecutionError, BlockExecutionSuccess] = {
+
+    val result = consensus.validators.validateBlockAfterExecution(
+      block = block,
+      stateRootHash = stateRootHash,
+      receipts = receipts,
+      gasUsed = gasUsed
+    )
+
+    result match {
+      case Left(error) ⇒
+        log.error(s"[$context/validateAfterExecution] Block: ${block.idTag}. Reason: ${error.reason}")
+      case _ ⇒
+    }
+
+    result
   }
 
   /**
@@ -572,7 +613,12 @@ sealed trait BranchResolutionResult
 case class  NewBetterBranch(oldBranch: Seq[Block]) extends BranchResolutionResult
 case object NoChainSwitch extends BranchResolutionResult
 case object UnknownBranch extends BranchResolutionResult
-case object InvalidBranch extends BranchResolutionResult
+
+sealed trait InvalidBranch extends BranchResolutionResult
+// headers do not form a chain
+case object InvalidBranchNoChain extends InvalidBranch
+// last header number is not greater or equal than current best block number
+case object InvalidBranchLastBlockNumberIsSmall extends InvalidBranch
 
 sealed trait BlockStatus
 case object InChain       extends BlockStatus
